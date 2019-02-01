@@ -1,11 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Text;
 using System.Threading;
-
 using System.Timers;
-
 
 namespace Telepathy.LoadTest
 {
@@ -13,6 +12,8 @@ namespace Telepathy.LoadTest
     {
         public static void StartClients(string host, int port, int clientAmount)
         {
+            Logger.LogError("starting " + clientAmount + " clients...");
+
             // start n clients and get queue messages all in this thread
             string message = "Sometimes we just need a good networking library";
             byte[] messageBytes = Encoding.ASCII.GetBytes(message);
@@ -27,6 +28,15 @@ namespace Telepathy.LoadTest
             }
             Logger.Log("started all clients");
 
+            // make sure that all clients connected successfully. otherwise
+            // the sleep might be too small, or other reasons. no point in
+            // load testing if the connect failed already.
+            if (!clients.All(cl => cl.Connected))
+            {
+                Logger.Log("not all clients were connected successfully. aborting.");
+                return;
+            }
+
             Stopwatch stopwatch = Stopwatch.StartNew();
 
             long messagesSent = 0;
@@ -35,6 +45,8 @@ namespace Telepathy.LoadTest
 
             var timer = new System.Timers.Timer(1000.0 / clientFrequency);
 
+            // THIS HAPPENS IN DIFFERENT THREADS.
+            // so make sure that GetNextMessage is thread safe!
             timer.Elapsed += (object sender, ElapsedEventArgs e) =>
             {
 
@@ -62,16 +74,17 @@ namespace Telepathy.LoadTest
 
 
                 // report every 10 seconds
-                if (stopwatch.ElapsedMilliseconds > 1000 * 10)
+                if (stopwatch.ElapsedMilliseconds > 1000 * 2)
                 {
                     long bandwithIn = dataReceived * 1000 / (stopwatch.ElapsedMilliseconds * 1024);
                     long bandwithOut = messagesSent * messageBytes.Length * 1000 / (stopwatch.ElapsedMilliseconds * 1024);
 
-                    Logger.Log(string.Format("Client in={0} ({1} KB/s)  out={2} ({3} KB/s)",
+                    Logger.Log(string.Format("Thread[" + Thread.CurrentThread.ManagedThreadId + "]: Client in={0} ({1} KB/s)  out={2} ({3} KB/s), ReceiveQueueAvg={4}",
                                              messagesReceived,
                                              bandwithIn,
                                              messagesSent,
-                                             bandwithOut));
+                                             bandwithOut,
+                                             (clients.Sum(cl => cl.ReceiveQueueCount) / clients.Count)));
                     stopwatch.Stop();
                     stopwatch = Stopwatch.StartNew();
                     messagesSent = 0;

@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
@@ -9,13 +10,11 @@ namespace Telepathy
     public class Server : Common
     {
         // listener
-        TcpListener listener;
+        public TcpListener listener;
         Thread listenerThread;
 
         // clients with <connectionId, TcpClient>
-        SafeDictionary<int, TcpClient> clients = new SafeDictionary<int, TcpClient>();
-
-        public bool NoDelay = true;
+        ConcurrentDictionary<int, TcpClient> clients = new ConcurrentDictionary<int, TcpClient>();
 
         // connectionId counter
         // (right now we only use it from one listener thread, but we might have
@@ -45,23 +44,12 @@ namespace Telepathy
         }
 
         // check if the server is running
-        public bool Active
-        {
-            get { return listenerThread != null && listenerThread.IsAlive; }
-        }
-
-        public TcpClient GetClient(int connectionId)
-        {
-            TcpClient client;
-            if (clients.TryGetValue(connectionId, out client))
-            {
-                return client;
-            }
-            return null;
-        }
+        public bool Active => listenerThread != null && listenerThread.IsAlive;
 
         // the listener thread's listen function
-        void Listen(int port, int maxConnections)
+        // note: no maxConnections parameter. high level API should handle that.
+        //       (Transport can't send a 'too full' message anyway)
+        void Listen(int port)
         {
             // absolutely must wrap with try/catch, otherwise thread
             // exceptions are silent
@@ -69,11 +57,10 @@ namespace Telepathy
             {
                 // start listener
                 listener = new TcpListener(new IPEndPoint(IPAddress.Any, port));
-                // NoDelay disables nagle algorithm. lowers CPU% and latency
-                // but increases bandwidth
-                listener.Server.NoDelay = this.NoDelay;
+                listener.Server.NoDelay = NoDelay;
+                listener.Server.SendTimeout = SendTimeout;
                 listener.Start();
-                Logger.Log("Server: listening port=" + port + " max=" + maxConnections);
+                Logger.Log("Server: listening port=" + port);
 
                 // keep accepting new clients
                 while (true)
@@ -84,36 +71,64 @@ namespace Telepathy
                     // in the thread
                     TcpClient client = listener.AcceptTcpClient();
 
-                    // are more connections allowed?
-                    if (clients.Count < maxConnections)
-                    {
-                        // generate the next connection id (thread safely)
-                        int connectionId = NextConnectionId();
+                    // generate the next connection id (thread safely)
+                    int connectionId = NextConnectionId();
 
-                        // spawn a thread for each client to listen to his
-                        // messages
-                        Thread thread = new Thread(() =>
+                    // spawn a send thread for each client
+                    Thread sendThread = new Thread(() =>
+                    {
+                        // wrap in try-catch, otherwise Thread exceptions
+                        // are silent
+                        try
+                        {
+                            // create send queue immediately
+                            SafeQueue<byte[]> sendQueue = new SafeQueue<byte[]>();
+                            sendQueues[connectionId] = sendQueue;
+
+                            // run the send loop
+                            SendLoop(connectionId, client, sendQueue);
+
+                            // remove queue from queues afterwards
+                            sendQueues.TryRemove(connectionId, out SafeQueue<byte[]> _);
+                        }
+                        catch (ThreadAbortException)
+                        {
+                            // happens on stop. don't log anything.
+                            // (we catch it in SendLoop too, but it still gets
+                            //  through to here when aborting. don't show an
+                            //  error.)
+                        }
+                        catch (Exception exception)
+                        {
+                            Logger.LogError("Server send thread exception: " + exception);
+                        }
+                    });
+                    sendThread.IsBackground = true;
+                    sendThread.Start();
+
+                    // spawn a receive thread for each client
+                    Thread receiveThread = new Thread(() =>
+                    {
+                        // wrap in try-catch, otherwise Thread exceptions
+                        // are silent
+                        try
                         {
                             // add to dict immediately
-                            clients.Add(connectionId, client);
+                            clients[connectionId] = client;
 
                             // run the receive loop
-                            ReceiveLoop(connectionId, client, messageQueue);
+                            ReceiveLoop(connectionId, client, receiveQueue);
 
                             // remove client from clients dict afterwards
-                            clients.Remove(connectionId);
-                        });
-                        thread.IsBackground = true;
-                        thread.Start();
-                    }
-                    // connection limit reached. disconnect the client and show
-                    // a small log message so we know why it happened.
-                    // note: no extra Sleep because Accept is blocking anyway
-                    else
-                    {
-                        client.Close();
-                        Logger.Log("Server too full, disconnected a client");
-                    }
+                            clients.TryRemove(connectionId, out TcpClient _);
+                        }
+                        catch (Exception exception)
+                        {
+                            Logger.LogError("Server client thread exception: " + exception);
+                        }
+                    });
+                    receiveThread.IsBackground = true;
+                    receiveThread.Start();
                 }
             }
             catch (ThreadAbortException exception)
@@ -137,22 +152,26 @@ namespace Telepathy
 
         // start listening for new connections in a background thread and spawn
         // a new thread for each one.
-        public void Start(int port, int maxConnections = int.MaxValue)
+        public bool Start(int port)
         {
             // not if already started
-            if (Active) return;
+            if (Active) return false;
 
             // clear old messages in queue, just to be sure that the caller
             // doesn't receive data from last time and gets out of sync.
             // -> calling this in Stop isn't smart because the caller may
             //    still want to process all the latest messages afterwards
-            messageQueue.Clear();
+            receiveQueue = new ConcurrentQueue<Message>();
 
             // start the listener thread
-            Logger.Log("Server: Start port=" + port + " max=" + maxConnections);
-            listenerThread = new Thread(() => { Listen(port, maxConnections); });
+            // (on low priority. if main thread is too busy then there is not
+            //  much value in accepting even more clients)
+            Logger.Log("Server: Start port=" + port);
+            listenerThread = new Thread(() => { Listen(port); });
             listenerThread.IsBackground = true;
+            listenerThread.Priority = ThreadPriority.BelowNormal;
             listenerThread.Start();
+            return true;
         }
 
         public void Stop()
@@ -164,12 +183,20 @@ namespace Telepathy
 
             // stop listening to connections so that no one can connect while we
             // close the client connections
-            listener.Stop();
+            // (might be null if we call Stop so quickly after Start that the
+            //  thread was interrupted before even creating the listener)
+            listener?.Stop();
+
+            // kill listener thread at all costs. only way to guarantee that
+            // .Active is immediately false after Stop.
+            // -> calling .Join would sometimes wait forever
+            listenerThread?.Interrupt();
+            listenerThread = null;
 
             // close all client connections
-            List<TcpClient> connections = clients.GetValues();
-            foreach (TcpClient client in connections)
+            foreach (KeyValuePair<int, TcpClient> kvp in clients)
             {
+                TcpClient client = kvp.Value;
                 // close the stream if not closed yet. it may have been closed
                 // by a disconnect already, so use try/catch
                 try { client.GetStream().Close(); } catch {}
@@ -183,21 +210,15 @@ namespace Telepathy
         // send message to client using socket connection.
         public bool Send(int connectionId, byte[] data)
         {
-            // find the connection
-            TcpClient client;
-            if (clients.TryGetValue(connectionId, out client))
+            // was the sendqueue created yet?
+            SafeQueue<byte[]> sendQueue;
+            if (sendQueues.TryGetValue(connectionId, out sendQueue))
             {
-                // GetStream() might throw exception if client is disconnected
-                try
-                {
-                    NetworkStream stream = client.GetStream();
-                    return SendMessage(stream, data);
-                }
-                catch (Exception exception)
-                {
-                    Logger.LogWarning("Server.Send exception: " + exception);
-                    return false;
-                }
+                // add to send queue and return immediately.
+                // calling Send here would be blocking (sometimes for long times
+                // if other side lags or wire was disconnected)
+                sendQueue.Enqueue(data);
+                return true;
             }
             Logger.LogWarning("Server.Send: invalid connectionId: " + connectionId);
             return false;
